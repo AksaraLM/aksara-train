@@ -330,9 +330,13 @@ def train(args: argparse.Namespace) -> int:
             labels = labels.to(device)
 
         logits, _ = model(input_ids)
+        # logits[i] predicts the token at position i+1, so shift by one before
+        # computing cross-entropy against the labels tensor.
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
         loss = nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
             ignore_index=-100,
         )
         (loss / args.grad_accum).backward()

@@ -192,8 +192,23 @@ def train(args: argparse.Namespace) -> int:
             )
             return 1
 
+    # ── Resume (local ckpt_{step}) — resolve BEFORE optimizer so opt
+    #    references the final model's parameters, not a stale copy.
+    start_step = 0
+    latest = sorted(
+        glob.glob(os.path.join(args.out_dir, "ckpt_*")),
+        key=lambda p: int(p.split("_")[-1]) if p.split("_")[-1].isdigit() else 0,
+    )
+    resume_ckpt = latest[-1] if (latest and not args.dry_run) else None
+
     # ── Model ─────────────────────────────────────────────────────
-    model = aksaraLLMModel(cfg).to(torch.bfloat16 if not args.dry_run else torch.float32)
+    if resume_ckpt is not None:
+        log(f"Resuming from {resume_ckpt}")
+        model = aksaraLLMModel.from_pretrained(resume_ckpt, map_location="cpu")
+        start_step = int(os.path.basename(resume_ckpt).split("_")[-1])
+    else:
+        model = aksaraLLMModel(cfg)
+    model = model.to(torch.bfloat16 if not args.dry_run else torch.float32)
     if not args.dry_run:
         model.gradient_checkpointing_enable()
     model.to(device)
@@ -246,20 +261,21 @@ def train(args: argparse.Namespace) -> int:
         fused=False,
     )
 
+    # Restore optimizer state if a matching file is present — this lets
+    # AdamW momentum and the LR schedule resume exactly where they left off.
+    if resume_ckpt is not None:
+        opt_path = os.path.join(resume_ckpt, "optimizer.pt")
+        if os.path.exists(opt_path):
+            try:
+                opt.load_state_dict(torch.load(opt_path, map_location="cpu"))
+                log(f"Loaded optimizer state from {opt_path}")
+            except Exception as e:
+                log(f"Optimizer state load failed ({e}); starting fresh momentum.",
+                    level="WARN")
+
     grad_accum = max(1, args.grad_accum)
     max_steps = args.max_steps if args.max_steps is not None else cfg.max_steps
     warmup_steps = cfg.warmup_steps if not args.dry_run else 0
-
-    # ── Resume (local ckpt_{step}) ────────────────────────────────
-    start_step = 0
-    latest = sorted(glob.glob(os.path.join(args.out_dir, "ckpt_*")),
-                    key=lambda p: int(p.split("_")[-1]) if p.split("_")[-1].isdigit() else 0)
-    if latest and not args.dry_run:
-        ckpt = latest[-1]
-        log(f"Resuming from {ckpt}")
-        model = aksaraLLMModel.from_pretrained(ckpt, map_location="cpu")
-        model.to(device)
-        start_step = int(os.path.basename(ckpt).split("_")[-1])
 
     # ── Main loop ─────────────────────────────────────────────────
     it = iter(mp_loader)
@@ -311,13 +327,13 @@ def train(args: argparse.Namespace) -> int:
                 f"{spd:.2f}it/s ETA={eta_min:.1f}m")
 
         if (not args.dry_run) and step % args.save_every == 0:
-            _save_checkpoint(model, args.out_dir, step, device, xm)
+            _save_checkpoint(model, opt, args.out_dir, step, device, xm)
 
         if args.dry_run and step >= 3:
             break
 
     if not args.dry_run:
-        _save_checkpoint(model, args.out_dir, step, device, xm)
+        _save_checkpoint(model, opt, args.out_dir, step, device, xm)
 
     log("Pretraining finished.")
     if args.dry_run:
@@ -329,7 +345,7 @@ def train(args: argparse.Namespace) -> int:
     return 0
 
 
-def _save_checkpoint(model, out_dir: str, step: int, device, xm) -> None:
+def _save_checkpoint(model, opt, out_dir: str, step: int, device, xm) -> None:
     ckpt_dir = os.path.join(out_dir, f"ckpt_{step}")
     os.makedirs(ckpt_dir, exist_ok=True)
     # XLA tensors must move to CPU before save_pretrained.
@@ -337,6 +353,11 @@ def _save_checkpoint(model, out_dir: str, step: int, device, xm) -> None:
     underlying.to("cpu")
     underlying.save_pretrained(ckpt_dir)
     underlying.to(device)
+    # Persist optimizer state so AdamW momentum survives resume.
+    try:
+        torch.save(opt.state_dict(), os.path.join(ckpt_dir, "optimizer.pt"))
+    except Exception as e:
+        log(f"Optimizer save failed: {e}", level="WARN")
     log(f"Saved checkpoint → {ckpt_dir}")
     gc.collect()
 
