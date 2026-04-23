@@ -265,31 +265,38 @@ def train(args: argparse.Namespace) -> int:
 
     losses: list[float] = []
     margins: list[float] = []
+    # Persistent iterator — recreate only when the dataset is exhausted.
+    # Avoids spinning up a fresh pl.MpDeviceLoader prefetch thread every step.
+    it = iter(loader)
     for step in range(max_steps):
-        for batch in loader:
-            ic, lc, ir, lr_ = batch
-            if xm is None:
-                ic, lc, ir, lr_ = [t.to(device) for t in (ic, lc, ir, lr_)]
+        try:
+            batch = next(it)
+        except StopIteration:
+            it = iter(loader)
+            batch = next(it)
 
-            loss, margin = dpo_loss(policy, ref, ic, lc, ir, lr_, beta=args.beta)
-            (loss / args.grad_accum).backward()
+        ic, lc, ir, lr_ = batch
+        if xm is None:
+            ic, lc, ir, lr_ = [t.to(device) for t in (ic, lc, ir, lr_)]
 
-            if (step + 1) % args.grad_accum == 0:
-                if xm is not None:
-                    xm.reduce_gradients(opt)
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in policy.parameters() if p.requires_grad], 1.0
-                )
-                opt.step()
-                opt.zero_grad(set_to_none=True)
-                if xm is not None:
-                    xm.mark_step()
+        loss, margin = dpo_loss(policy, ref, ic, lc, ir, lr_, beta=args.beta)
+        (loss / args.grad_accum).backward()
 
-            losses.append(loss.item())
-            margins.append(margin)
+        if (step + 1) % args.grad_accum == 0:
+            if xm is not None:
+                xm.reduce_gradients(opt)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in policy.parameters() if p.requires_grad], 1.0
+            )
+            opt.step()
+            opt.zero_grad(set_to_none=True)
             if xm is not None:
                 xm.mark_step()
-            break  # one batch per outer step (makes step counting simple)
+
+        losses.append(loss.item())
+        margins.append(margin)
+        if xm is not None:
+            xm.mark_step()
 
         if (step + 1) % args.log_every == 0 or step == max_steps - 1:
             recent_l = losses[-args.log_every:]

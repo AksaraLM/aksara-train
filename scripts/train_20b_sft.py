@@ -195,23 +195,40 @@ class SFTDataset(Dataset):
     ):
         self.samples: list[tuple[list[int], list[int]]] = []
         pad = tokenizer.pad_token_id
+
+        # Pre-compute the assistant-response marker in the token stream.
+        # The AksaraLLM template closes every user turn with ``[/INST]`` and
+        # the assistant reply immediately follows. We mask everything up to
+        # and including the *last* ``[/INST]`` so that only the final
+        # assistant turn contributes to the CE loss — this correctly handles
+        # both single- and multi-turn dialogues and avoids BPE-boundary
+        # mismatches from tokenizing the prompt separately.
+        inst_end_ids = tokenizer.encode("[/INST]")
+        if not inst_end_ids:
+            raise RuntimeError("Tokenizer does not encode the [/INST] marker.")
+
         for ex in records:
-            # Split into prompt (system+user) and completion (assistant+EOS).
-            prompt_msgs = [m for m in ex.messages if m["role"] in ("system", "user")]
-            completion_msgs = [m for m in ex.messages if m["role"] == "assistant"]
-            if not completion_msgs:
+            if not any(m["role"] == "assistant" for m in ex.messages):
                 continue
 
-            prompt_text = render_chat(prompt_msgs, add_generation_prompt=False)
             full_text = render_chat(ex.messages, add_generation_prompt=False)
-
-            prompt_ids = tokenizer.encode(prompt_text)
             full_ids = tokenizer.encode(full_text)
             if len(full_ids) > max_len:
                 full_ids = full_ids[:max_len]
-                prompt_ids = prompt_ids[: min(len(prompt_ids), max_len - 1)]
 
-            labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+            # Find the *last* [/INST] occurrence — response start = right after.
+            split = -1
+            for j in range(len(full_ids) - len(inst_end_ids), -1, -1):
+                if full_ids[j : j + len(inst_end_ids)] == inst_end_ids:
+                    split = j + len(inst_end_ids)
+                    break
+            if split < 0 or split >= len(full_ids):
+                # No assistant response inside max_len; skip rather than train
+                # on a fully masked sequence.
+                continue
+
+            labels = [-100] * split + full_ids[split:]
+
             # Pad to a fixed length for XLA-friendly constant shapes.
             pad_len = max_len - len(full_ids)
             full_ids = full_ids + [pad] * pad_len
@@ -277,10 +294,13 @@ def train(args: argparse.Namespace) -> int:
 
     # ── Data ───────────────────────────────────────────────────────
     if args.dry_run:
+        # Use a very short system prompt so everything fits inside the
+        # tiny 64-token ``max_seq_len``.
+        _sys = "AksaraLLM."
         records = [
             SFTExample(
                 messages=[
-                    {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+                    {"role": "system", "content": _sys},
                     {"role": "user", "content": "siapa kamu?"},
                     {"role": "assistant", "content": "saya aksarallm."},
                 ],
@@ -288,8 +308,8 @@ def train(args: argparse.Namespace) -> int:
             ),
             SFTExample(
                 messages=[
-                    {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
-                    {"role": "user", "content": "apa ibu kota indonesia?"},
+                    {"role": "system", "content": _sys},
+                    {"role": "user", "content": "apa ibu kota?"},
                     {"role": "assistant", "content": "jakarta."},
                 ],
             ),
